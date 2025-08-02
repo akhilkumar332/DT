@@ -1,6 +1,4 @@
-// Firmware for ESP32-S3-A with SIM7670X-4G
-// Based on provided unified sensor system sketch
-
+// === Libraries ===
 #define TINY_GSM_MODEM_A7670
 #define TINY_GSM_RX_BUFFER 1024
 
@@ -45,8 +43,13 @@ const uint32_t SAMPLE_RATE = 16000;
 // === GSM Config ===
 const char apn[] = "INTERNET";
 const char* server = "63.177.227.146";
-const char* dataPath = "/data";
-const char* wavPath = "/upload";
+
+// TODO: load from EEPROM in production
+const char* deviceId = "TEST_DEVICE_ID";
+
+const char motionPath[] = "/api/motion";
+const char heartPath[] = "/api/heart";
+const char soundPath[] = "/api/sound";
 
 TinyGsm modem(SerialAT);
 TinyGsmClient client(modem);
@@ -125,30 +128,33 @@ void readAndSendMotion() {
   float speed = sqrt(fax * fax + fay * fay + faz * faz);
   String movement = speed > 1.8 ? "running" : speed > 1.2 ? "walking" : "still";
 
-  StaticJsonDocument<256> doc;
-  doc["gyroscope"]["x"] = gx;
-  doc["gyroscope"]["y"] = gy;
-  doc["gyroscope"]["z"] = gz;
-  doc["accelerometer"]["x"] = fax;
-  doc["accelerometer"]["y"] = fay;
-  doc["accelerometer"]["z"] = faz;
-  doc["tilt"] = tilt;
-  doc["orientation"] = orientation;
-  doc["movement"] = movement;
-  doc["timestamp"] = millis();
+  StaticJsonDocument<256> sensorDoc;
+  sensorDoc["gyroscope"]["x"] = gx;
+  sensorDoc["gyroscope"]["y"] = gy;
+  sensorDoc["gyroscope"]["z"] = gz;
+  sensorDoc["accelerometer"]["x"] = fax;
+  sensorDoc["accelerometer"]["y"] = fay;
+  sensorDoc["accelerometer"]["z"] = faz;
+  sensorDoc["tilt"] = tilt;
+  sensorDoc["orientation"] = orientation;
+  sensorDoc["movement"] = movement;
+  sensorDoc["timestamp"] = millis();
+
+  StaticJsonDocument<512> root;
+  root["deviceId"] = deviceId;
+  root["data"] = sensorDoc;
 
   String payload;
-  serializeJson(doc, payload);
+  serializeJson(root, payload);
   Serial.println("📦 Motion: "); Serial.println(payload);
 
   if (client.connect(server, 80)) {
-    client.println(String("POST ") + dataPath + " HTTP/1.1");
+    client.println(String("POST ") + motionPath + " HTTP/1.1");
     client.println("Host: " + String(server));
     client.println("Content-Type: application/json");
     client.println("Content-Length: " + payload.length());
     client.println(); client.print(payload);
 
-    // ✅ Confirmation
     unsigned long timeout = millis();
     while (client.connected() && millis() - timeout < 3000) {
       if (client.available()) {
@@ -187,17 +193,22 @@ void readAndSendHeartRate() {
     }
   }
 
-  String payload = "bpm=" + String(beatAvg) + "&ir=" + String(irValue);
+  StaticJsonDocument<128> root;
+  root["deviceId"] = deviceId;
+  root["bpm"] = beatAvg;
+  root["ir"] = irValue;
+
+  String payload;
+  serializeJson(root, payload);
   Serial.println("❤️ Heart: " + payload);
 
   if (client.connect(server, 80)) {
-    client.println(String("POST ") + dataPath + " HTTP/1.1");
+    client.println(String("POST ") + heartPath + " HTTP/1.1");
     client.println("Host: " + String(server));
-    client.println("Content-Type: application/x-www-form-urlencoded");
+    client.println("Content-Type: application/json");
     client.println("Content-Length: " + payload.length());
     client.println(); client.print(payload);
 
-    // ✅ Confirmation
     unsigned long timeout = millis();
     while (client.connected() && millis() - timeout < 3000) {
       if (client.available()) {
@@ -315,19 +326,33 @@ void recordAndSendCompressedWav() {
   }
 
   Serial.println("📤 Uploading WAV...");
+
   if (!client.connect(server, 80)) {
     Serial.println("❌ Server connect failed");
+    free(samples);
+    free(adpcm_data);
     return;
   }
 
   uint32_t totalLen = 44 + ADPCM_SIZE;
-  client.println("POST /upload HTTP/1.1");
-  client.println("Host: 63.177.227.146");
-  client.println("Content-Type: audio/wav");
+  String boundary = "----DogTrackerBoundary";
+  String head = "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"deviceId\"\r\n\r\n";
+  head += deviceId;
+  head += "\r\n--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n";
+  head += "Content-Type: audio/wav\r\n\r\n";
+  String tail = "\r\n--" + boundary + "--\r\n";
+  uint32_t contentLength = head.length() + totalLen + tail.length();
+
+  client.println(String("POST ") + soundPath + " HTTP/1.1");
+  client.println("Host: " + String(server));
+  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
   client.print("Content-Length: ");
-  client.println(totalLen);
+  client.println(contentLength);
   client.println();
 
+  client.print(head);
   unsigned long start = millis();
   for (uint32_t i = 0; i < totalLen;) {
     uint32_t len = std::min((uint32_t)256, totalLen - i);
@@ -345,6 +370,7 @@ void recordAndSendCompressedWav() {
     Serial.print(pct);
     Serial.print("%");
   }
+  client.print(tail);
   Serial.println();
 
   while (client.connected()) {
@@ -404,4 +430,3 @@ void setupGSM() {
     while (1);
   }
 }
-
